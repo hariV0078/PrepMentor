@@ -1,0 +1,39 @@
+
+> frontend@0.0.0 lint
+> eslint .
+
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts
+  48:32  error  Error: Cannot access variable before it is declared
+
+`playNextAudio` is accessed before it is declared, which prevents the earlier access from updating when this value changes over time.
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts:48:32
+  46 |         source.buffer = buffer!;
+  47 |         source.connect(audioContextRef.current!.destination);
+> 48 |         source.onended = () => playNextAudio();
+     |                                ^^^^^^^^^^^^^ `playNextAudio` accessed before it is declared
+  49 |         source.start();
+  50 |     }, []);
+  51 |
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts:35:5
+  33 |     }, []);
+  34 |
+> 35 |     const playNextAudio = useCallback(() => {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 36 |         if (playQueueRef.current.length === 0) {
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 37 |             isPlayingRef.current = false;
+     …
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 49 |         source.start();
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 50 |     }, []);
+     | ^^^^^^^^^^^^ `playNextAudio` is declared here
+  51 |
+  52 |     const connectWebSocket = useCallback(() => {
+  53 |         setStatus('Connecting');  react-hooks/immutability
+
+✖ 1 problem (1 error, 0 warnings)
+

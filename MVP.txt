@@ -1,0 +1,1204 @@
+# Real-Time Voice-to-Voice Pipeline MVP
+## Ultra-Low Latency Conversational AI System
+
+**Target Latency:** 1.2s - 2.0s (End-to-End)  
+**Architecture:** Full-Duplex WebSocket + Streaming Pipeline  
+**Last Updated:** February 2026
+
+---
+
+## Table of Contents
+1. [Executive Summary](#executive-summary)
+2. [System Architecture](#system-architecture)
+3. [Optimized Model Selection](#optimized-model-selection)
+4. [Detailed Workflow](#detailed-workflow)
+5. [Technical Stack](#technical-stack)
+6. [Latency Optimization Strategy](#latency-optimization-strategy)
+7. [Implementation Guide](#implementation-guide)
+8. [Performance Benchmarks](#performance-benchmarks)
+
+---
+
+## Executive Summary
+
+This MVP delivers a **real-time voice conversation system** where users speak naturally and receive AI-generated voice responses with minimal delay. The key innovation is **streaming sentence-level pipelining**: audio generation begins before the LLM completes its full response.
+
+### Core Value Proposition
+- **Sub-2-second response time** from user speech end to audio playback start
+- **Natural conversation flow** with proper turn-taking
+- **Production-ready architecture** using battle-tested components
+- **Scalable design** supporting multiple concurrent connections
+
+---
+
+## System Architecture
+
+### High-Level Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                            CLIENT (Browser)                              │
+│  ┌──────────────┐         ┌──────────────┐         ┌──────────────┐   │
+│  │ Microphone   │────────▶│  WebSocket   │◀────────│ Audio Player │   │
+│  │ (16kHz PCM)  │         │   Client     │         │  (Queue)     │   │
+│  └──────────────┘         └──────┬───────┘         └──────────────┘   │
+└─────────────────────────────────┼──────────────────────────────────────┘
+                                   │
+                                   │ Binary Audio Chunks (20ms)
+                                   │
+┌─────────────────────────────────┼──────────────────────────────────────┐
+│                            SERVER (FastAPI)                              │
+│                                   │                                      │
+│  ┌────────────────────────────────▼───────────────────────────────┐    │
+│  │              WebSocket Handler (/ws/audio)                      │    │
+│  │                    (Async Event Loop)                           │    │
+│  └────┬─────────────────────────────────────────────────────┬─────┘    │
+│       │                                                      │           │
+│       ▼                                                      │           │
+│  ┌─────────────────┐                                        │           │
+│  │  VAD Service    │                                        │           │
+│  │  (Silero v5)    │                                        │           │
+│  │                 │                                        │           │
+│  │  • Speech Det.  │                                        │           │
+│  │  • Silence Det. │                                        │           │
+│  │  • End-of-Turn  │                                        │           │
+│  └────┬────────────┘                                        │           │
+│       │ Speech End Detected                                 │           │
+│       ▼                                                      │           │
+│  ┌─────────────────┐                                        │           │
+│  │  STT Service    │                                        │           │
+│  │  (Whisper)      │                                        │           │
+│  │                 │                                        │           │
+│  │  Model: v3      │                                        │           │
+│  │  Turbo / Distil │                                        │           │
+│  └────┬────────────┘                                        │           │
+│       │ Transcript Text                                     │           │
+│       ▼                                                      │           │
+│  ┌─────────────────┐                                        │           │
+│  │  LLM Service    │                                        │           │
+│  │  (Streaming)    │                                        │           │
+│  │                 │                                        │           │
+│  │  • Gemini Flash │──── Token Stream ────┐                │           │
+│  │  • GPT-4o-mini  │                      │                │           │
+│  └─────────────────┘                      │                │           │
+│                                            ▼                │           │
+│                                   ┌─────────────────┐      │           │
+│                                   │ Sentence Buffer │      │           │
+│                                   │                 │      │           │
+│                                   │  Accumulate     │      │           │
+│                                   │  until ./!/? │      │           │
+│                                   └────┬────────────┘      │           │
+│                                        │ Complete Sentence │           │
+│                                        ▼                    │           │
+│                                   ┌─────────────────┐      │           │
+│                                   │  TTS Service    │      │           │
+│                                   │  (Async)        │      │           │
+│                                   │                 │      │           │
+│                                   │  • Kokoro-82M   │──────┘           │
+│                                   │  • StyleTTS2    │  Audio Bytes     │
+│                                   │  • F5-TTS       │                  │
+│                                   └─────────────────┘                  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Optimized Model Selection
+
+### Decision Matrix: Model Selection by Priority
+
+| Component | Primary Choice | Backup Option | Rationale |
+|-----------|---------------|---------------|-----------|
+| **VAD** | Silero VAD v5 | WebRTC VAD | Best accuracy/speed tradeoff, ONNX runtime |
+| **STT** | Faster-Whisper (distil-large-v3) | Whisper v3-turbo | 5-7x faster than base Whisper, minimal accuracy loss |
+| **LLM** | Gemini 1.5 Flash-8B | GPT-4o-mini / Claude Haiku | Fastest TTFT (~180ms), excellent streaming |
+| **TTS** | Kokoro-82M | StyleTTS2 / F5-TTS | 82M params = 50-100ms latency, natural prosody |
+
+### Detailed Model Analysis
+
+#### 1. Voice Activity Detection (VAD)
+
+**Selected: Silero VAD v5**
+
+```python
+# Specifications
+Model Size: 6MB
+Inference Time: <5ms per chunk
+Supported Sample Rates: 8kHz, 16kHz
+False Positive Rate: <2%
+```
+
+**Why Silero?**
+- ✅ Lightweight ONNX model runs on CPU without GPU overhead
+- ✅ Superior noise handling compared to WebRTC VAD
+- ✅ Configurable sensitivity (we use 0.5 threshold)
+- ✅ Production-proven in millions of deployments
+
+**Configuration:**
+```python
+vad_model = silero_vad.load_silero_vad(onnx=True)
+threshold = 0.5  # 0-1, higher = more aggressive
+speech_pad_ms = 300  # Min silence before end-of-turn
+```
+
+---
+
+#### 2. Speech-to-Text (STT)
+
+**Selected: Faster-Whisper (distil-large-v3)**
+
+```python
+# Performance Metrics (RTX 4090)
+Model: distil-large-v3
+Quantization: int8
+Avg Latency: 180-350ms (for 3-5 sec audio)
+WER: 4.2% (vs 3.8% for large-v3)
+Memory: 2.1GB VRAM
+```
+
+**Why Faster-Whisper + Distil?**
+- ✅ CTranslate2 optimization: 5-7x faster than HuggingFace Whisper
+- ✅ Distil variant: 50% smaller, only 0.4% WER degradation
+- ✅ Streaming-friendly: Can process in chunks if needed
+- ✅ GPU/CPU flexible: Falls back gracefully
+
+**Alternative Comparison:**
+
+| Model | Latency (3s audio) | WER | VRAM | Notes |
+|-------|-------------------|-----|------|-------|
+| **distil-large-v3** | 180-350ms | 4.2% | 2.1GB | **✓ Recommended** |
+| large-v3-turbo | 250-400ms | 3.9% | 3.8GB | If accuracy critical |
+| whisper.cpp | 150-300ms | 4.5% | 1.2GB | C++ binary, harder to integrate |
+
+**Configuration:**
+```python
+model = WhisperModel(
+    "distil-large-v3",
+    device="cuda",
+    compute_type="int8",
+    num_workers=2
+)
+
+segments, info = model.transcribe(
+    audio,
+    beam_size=1,  # Greedy decoding for speed
+    language="en",
+    vad_filter=False  # We handle VAD upstream
+)
+```
+
+---
+
+#### 3. Large Language Model (LLM)
+
+**Selected: Gemini 1.5 Flash-8B**
+
+```python
+# Performance Metrics
+Time to First Token (TTFT): 180-280ms
+Tokens/Second: 120-180
+Context Window: 1M tokens
+Cost: $0.075 / 1M input tokens
+Streaming: Native support
+```
+
+**Why Gemini Flash-8B?**
+- ✅ **Fastest TTFT** among production LLMs (critical for perceived latency)
+- ✅ **Native streaming** with proper sentence boundaries
+- ✅ **Free tier**: 15 RPM, 1M TPM (perfect for MVP)
+- ✅ **Function calling** support for future features
+- ✅ **Multimodal ready** (can add vision later)
+
+**Alternative Comparison:**
+
+| Model | TTFT | Tokens/sec | Cost (1M tok) | Use Case |
+|-------|------|------------|---------------|----------|
+| **Gemini Flash-8B** | 180ms | 150 | $0.075 | **✓ MVP Choice** |
+| GPT-4o-mini | 320ms | 110 | $0.150 | Higher quality needed |
+| Claude Haiku | 250ms | 140 | $0.250 | Complex reasoning |
+| Llama 3.1 8B (local) | 90ms | 80 | Free | Privacy-critical / offline |
+
+**Configuration:**
+```python
+generation_config = {
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "max_output_tokens": 150,  # Keep responses concise
+}
+
+response = model.generate_content(
+    prompt,
+    generation_config=generation_config,
+    stream=True  # CRITICAL for pipelining
+)
+
+# Sentence extraction
+for chunk in response:
+    token = chunk.text
+    if token.endswith(('.', '!', '?')):
+        yield accumulated_sentence
+```
+
+---
+
+#### 4. Text-to-Speech (TTS)
+
+**Selected: Kokoro-82M**
+
+```python
+# Performance Metrics
+Model Size: 82M parameters
+Inference Time: 50-120ms per sentence
+Quality: 4.2/5.0 MOS
+Real-Time Factor: 0.05-0.15x
+GPU: Optional (runs on CPU)
+```
+
+**Why Kokoro-82M?**
+- ✅ **Ultra-low latency**: 50-120ms for short sentences
+- ✅ **Tiny footprint**: 82M params vs 500M+ for competitors
+- ✅ **Natural prosody**: Trained on conversational speech
+- ✅ **CPU-friendly**: Can run on CPU without GPU
+- ✅ **Voice cloning**: Single reference audio for consistency
+
+**Alternative Comparison:**
+
+| Model | Latency (10 words) | Quality (MOS) | GPU Required | Notes |
+|-------|-------------------|---------------|--------------|-------|
+| **Kokoro-82M** | 50-120ms | 4.2 | No | **✓ Recommended** |
+| StyleTTS2 | 200-400ms | 4.5 | Yes | Higher quality |
+| F5-TTS | 300-600ms | 4.6 | Yes | Best quality |
+| Piper | 30-80ms | 3.8 | No | Robotic, but fastest |
+| Bark | 1500ms+ | 4.7 | Yes | Too slow for real-time |
+
+**Configuration:**
+```python
+# Initialize once
+model = Kokoro(
+    model_path="kokoro-82m",
+    device="cpu",  # or "cuda" if available
+    voice="af_bella"  # Natural female voice
+)
+
+# Per-sentence inference
+audio_bytes = model.synthesize(
+    text=sentence,
+    speed=1.1,  # Slightly faster for conversation
+    format="wav_bytes"
+)
+```
+
+**Voice Options:**
+- `af_bella`: Warm, conversational female
+- `am_adam`: Professional male
+- `bf_emma`: Energetic female
+
+---
+
+## Detailed Workflow
+
+### Complete Request Flow with Timing
+
+```
+┌─ Time: T=0ms ──────────────────────────────────────────────────────────┐
+│                                                                          │
+│  USER SPEAKS: "What's the weather like today?"                          │
+│  Duration: ~2000ms                                                       │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Client: Capture & Stream                                        │   │
+│  │ • 20ms chunks → WebSocket                                       │   │
+│  │ • Continuous upload during speech                               │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ Time: T=2000ms ────────────────────────────────────────────────────────┐
+│                                                                          │
+│  VAD DETECTS SILENCE (300ms threshold)                                  │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Server: VAD Processing                                          │   │
+│  │ • Last speech: T=2000ms                                         │   │
+│  │ • Silence starts: T=2000ms                                      │   │
+│  │ • Silence threshold: 300ms                                      │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ Time: T=2300ms ────────────────────────────────────────────────────────┐
+│                                                                          │
+│  TRIGGER STT PROCESSING                                                  │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ STT: Faster-Whisper                                             │   │
+│  │ • Input: 2000ms audio buffer                                    │   │
+│  │ • Processing time: 250ms                                        │   │
+│  │ • Output: "What's the weather like today?"                      │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ Time: T=2550ms ────────────────────────────────────────────────────────┐
+│                                                                          │
+│  LLM STREAMING BEGINS                                                    │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ LLM: Gemini Flash-8B                                            │   │
+│  │ • TTFT: 180ms                                                   │   │
+│  │ • Token stream starts                                           │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Sentence Buffer: Accumulating                                   │   │
+│  │ • Tokens: "I'll check the weather for you. It's..."            │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ Time: T=2730ms ────────────────────────────────────────────────────────┐
+│                                                                          │
+│  FIRST SENTENCE COMPLETE                                                 │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Sentence Buffer: "I'll check the weather for you."             │   │
+│  └────────┬───────────────────────────────────────────────────────┘   │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ TTS: Kokoro-82M (Async)                                         │   │
+│  │ • Processing: 80ms                                              │   │
+│  │ • Output: WAV bytes                                             │   │
+│  └────────┬───────────────────────────────────────────────────────┘   │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ WebSocket: Send audio chunk #1                                  │   │
+│  │ • Network latency: 50ms                                         │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ Time: T=2860ms ────────────────────────────────────────────────────────┐
+│                                                                          │
+│  🔊 FIRST AUDIO PLAYBACK STARTS (PERCEIVED LATENCY)                     │
+│                                                                          │
+│  Total latency: 2860ms - 2300ms = 560ms (after silence detection)      │
+│  Total latency: 2860ms - 2000ms = 860ms (from last speech)             │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Client: Audio Player                                            │   │
+│  │ • Playing: "I'll check the weather for you."                    │   │
+│  │ • Queue: [empty, waiting for next chunk]                        │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Meanwhile: LLM still generating...                              │   │
+│  │ • Sentence 2: "It's currently sunny and 72°F."                  │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─ Time: T=3200ms ────────────────────────────────────────────────────────┐
+│                                                                          │
+│  SECOND SENTENCE COMPLETE & PROCESSED                                    │
+│                                                                          │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ TTS: Sentence #2 → Audio chunk #2                              │   │
+│  └────────┬───────────────────────────────────────────────────────┘   │
+│           │                                                              │
+│           ▼                                                              │
+│  ┌────────────────────────────────────────────────────────────────┐   │
+│  │ Client: Audio Queue                                             │   │
+│  │ • Currently playing: Sentence 1 (ending)                        │   │
+│  │ • Queue: [Sentence 2 audio ready]                               │   │
+│  │ • Seamless transition (no gap)                                  │   │
+│  └────────────────────────────────────────────────────────────────┘   │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### State Machine Diagram
+
+```
+                    ┌─────────────────┐
+                    │   INITIALIZED   │
+                    └────────┬────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+              ┌────▶│    LISTENING    │◀────┐
+              │     └────────┬────────┘     │
+              │              │               │
+              │              │ Speech        │
+              │              │ Detected      │
+              │              ▼               │
+              │     ┌─────────────────┐     │
+              │     │   COLLECTING    │     │
+              │     │     AUDIO       │     │
+              │     └────────┬────────┘     │
+              │              │               │
+              │              │ Silence >     │
+              │              │ 300ms         │
+              │              ▼               │
+              │     ┌─────────────────┐     │
+              │     │  TRANSCRIBING   │     │
+              │     │      (STT)      │     │
+              │     └────────┬────────┘     │
+              │              │               │
+              │              │ Text Ready    │
+              │              ▼               │
+              │     ┌─────────────────┐     │
+              │     │   GENERATING    │     │
+              │     │    (LLM + TTS)  │     │
+              │     │                 │     │
+              │     │  ┌───────────┐  │     │
+              │     │  │  Sentence │──┼─────┤
+              │     │  │   Buffer  │  │     │ Audio
+              │     │  └─────┬─────┘  │     │ Chunks
+              │     │        │         │     │ Sent
+              │     │        ▼         │     │
+              │     │  ┌───────────┐  │     │
+              │     │  │    TTS    │──┼─────┘
+              │     │  │  (Async)  │  │
+              │     │  └───────────┘  │
+              │     └────────┬────────┘
+              │              │
+              │              │ All Sentences
+              │              │ Complete
+              │              ▼
+              │     ┌─────────────────┐
+              └─────┤     READY       │
+                    └─────────────────┘
+                             │
+                             │ Next
+                             │ Utterance
+                             ▼
+```
+
+---
+
+## Technical Stack
+
+### Backend Dependencies
+
+```python
+# requirements.txt
+
+# Core Framework
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+websockets==12.0
+python-multipart==0.0.6
+
+# Audio Processing
+numpy==1.26.3
+scipy==1.12.0
+librosa==0.10.1
+soundfile==0.12.1
+
+# VAD
+silero-vad==5.0  # Via torch hub or ONNX
+onnxruntime==1.17.0  # For optimized inference
+
+# STT
+faster-whisper==1.0.0  # CTranslate2 optimized
+ctranslate2==4.0.0
+
+# LLM
+google-generativeai==0.3.2  # Gemini SDK
+# OR
+openai==1.10.0  # For GPT-4o-mini fallback
+
+# TTS
+kokoro-tts==0.1.5  # Placeholder - use actual package
+# OR
+styletts2==0.2.0  # Fallback option
+
+# Utilities
+pydantic==2.5.0
+python-dotenv==1.0.0
+aiofiles==23.2.1
+
+# Monitoring
+prometheus-client==0.19.0  # Optional: metrics
+```
+
+### Frontend Stack
+
+```json
+{
+  "dependencies": {
+    "react": "^18.2.0",
+    "next": "^14.1.0",
+    "typescript": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "tailwindcss": "^3.4.0"
+  }
+}
+```
+
+---
+
+## Latency Optimization Strategy
+
+### Latency Breakdown & Optimization
+
+| Stage | Baseline | Optimized | Technique |
+|-------|----------|-----------|-----------|
+| **Network Upload** | 100ms | 50ms | • 20ms chunks<br>• Binary protocol<br>• Local testing reduces to ~5ms |
+| **VAD Processing** | 500ms | 300ms | • Lower silence threshold (300ms)<br>• Skip if clear end markers |
+| **STT Inference** | 600ms | 250ms | • Distil model<br>• int8 quantization<br>• beam_size=1 |
+| **LLM TTFT** | 400ms | 180ms | • Gemini Flash-8B<br>• Short system prompt<br>• Low max_tokens |
+| **Sentence Wait** | 800ms | 400ms | • Short responses<br>• Sentence boundary hints in prompt |
+| **TTS Inference** | 300ms | 80ms | • Kokoro-82M<br>• CPU inference (avoid GPU context switch)<br>• Pre-loaded model |
+| **Network Download** | 100ms | 50ms | • Streaming chunks<br>• WebSocket keep-alive |
+| **TOTAL** | **2800ms** | **1310ms** | **53% reduction** |
+
+### Critical Optimizations
+
+#### 1. Parallel Processing Architecture
+
+```python
+async def process_utterance(audio_buffer: bytes):
+    """
+    Parallel pipeline with async tasks
+    """
+    # Step 1: STT (blocking)
+    transcript = await stt_service.transcribe(audio_buffer)
+    
+    # Step 2: LLM Streaming (async generator)
+    sentence_stream = llm_service.generate_stream(transcript)
+    
+    # Step 3: TTS + Send (parallel)
+    tasks = []
+    async for sentence in sentence_stream:
+        # Launch TTS in background
+        task = asyncio.create_task(
+            synthesize_and_send(sentence, websocket)
+        )
+        tasks.append(task)
+    
+    # Wait for all audio to be sent
+    await asyncio.gather(*tasks)
+
+async def synthesize_and_send(text: str, ws: WebSocket):
+    """
+    TTS + WebSocket send in single task
+    """
+    audio_bytes = await tts_service.synthesize(text)
+    await ws.send_bytes(audio_bytes)
+```
+
+#### 2. Model Warm-up
+
+```python
+# startup.py
+async def warmup_models():
+    """
+    Pre-load models on server start
+    """
+    # VAD: Load ONNX model
+    vad = silero_vad.load_silero_vad()
+    
+    # STT: Load + dummy inference
+    whisper = WhisperModel("distil-large-v3", device="cuda")
+    whisper.transcribe(np.zeros(16000))  # 1 sec silence
+    
+    # TTS: Load + dummy synthesis
+    kokoro = Kokoro("kokoro-82m")
+    kokoro.synthesize("test")  # Warm up
+    
+    print("✓ All models warmed up")
+```
+
+#### 3. Sentence Boundary Optimization
+
+```python
+# System prompt addition for LLM
+system_prompt = """
+You are a voice assistant. Rules:
+1. Keep responses under 3 sentences
+2. End each sentence with . ! or ?
+3. Avoid long clauses before punctuation
+4. Be conversational and concise
+
+Example:
+Good: "Sure! I can help with that. What would you like to know?"
+Bad: "I can definitely help you with that, and I'm here to assist with any questions you might have about this topic."
+"""
+```
+
+#### 4. Audio Chunk Streaming
+
+```javascript
+// Client-side audio queue
+class AudioQueue {
+  constructor() {
+    this.queue = [];
+    this.isPlaying = false;
+    this.audioContext = new AudioContext({ sampleRate: 24000 });
+  }
+
+  async enqueue(audioBytes) {
+    const audioBuffer = await this.audioContext.decodeAudioData(audioBytes);
+    this.queue.push(audioBuffer);
+    
+    if (!this.isPlaying) {
+      this.playNext();
+    }
+  }
+
+  playNext() {
+    if (this.queue.length === 0) {
+      this.isPlaying = false;
+      return;
+    }
+
+    this.isPlaying = true;
+    const buffer = this.queue.shift();
+    const source = this.audioContext.createBufferSource();
+    
+    source.buffer = buffer;
+    source.connect(this.audioContext.destination);
+    source.onended = () => this.playNext();
+    source.start();
+  }
+}
+```
+
+---
+
+## Implementation Guide
+
+### Project Structure
+
+```
+voice-pipeline-mvp/
+├── backend/
+│   ├── main.py                 # FastAPI app + WebSocket endpoint
+│   ├── config.py               # Environment variables
+│   ├── services/
+│   │   ├── __init__.py
+│   │   ├── vad_service.py      # Silero VAD wrapper
+│   │   ├── stt_service.py      # Faster-Whisper wrapper
+│   │   ├── llm_service.py      # Gemini streaming logic
+│   │   └── tts_service.py      # Kokoro synthesis
+│   ├── utils/
+│   │   ├── audio_utils.py      # PCM conversion helpers
+│   │   └── sentence_splitter.py # Smart sentence detection
+│   └── models/                 # Downloaded model files
+│       ├── silero_vad.onnx
+│       └── kokoro-82m/
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx            # Main chat interface
+│   │   └── api/
+│   ├── components/
+│   │   ├── AudioRecorder.tsx   # Microphone handler
+│   │   └── AudioPlayer.tsx     # Playback queue
+│   └── lib/
+│       └── websocket.ts        # WS client logic
+├── docker-compose.yml          # Container orchestration
+├── requirements.txt
+└── README.md
+```
+
+### Backend Core Implementation
+
+```python
+# main.py
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from services import VADService, STTService, LLMService, TTSService
+import asyncio
+
+app = FastAPI()
+
+# Initialize services (singleton pattern)
+vad = VADService()
+stt = STTService()
+llm = LLMService()
+tts = TTSService()
+
+@app.websocket("/ws/audio")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    
+    audio_buffer = bytearray()
+    silence_chunks = 0
+    SILENCE_THRESHOLD = 15  # 15 chunks * 20ms = 300ms
+    
+    try:
+        while True:
+            # Receive audio chunk
+            data = await websocket.receive_bytes()
+            
+            # VAD processing
+            is_speech = vad.detect_speech(data)
+            
+            if is_speech:
+                audio_buffer.extend(data)
+                silence_chunks = 0
+            else:
+                silence_chunks += 1
+            
+            # Trigger pipeline on silence
+            if silence_chunks >= SILENCE_THRESHOLD and len(audio_buffer) > 0:
+                # Process in background to keep socket alive
+                asyncio.create_task(
+                    process_and_respond(audio_buffer, websocket)
+                )
+                audio_buffer.clear()
+                silence_chunks = 0
+                
+    except WebSocketDisconnect:
+        print("Client disconnected")
+
+async def process_and_respond(audio: bytes, ws: WebSocket):
+    """
+    Main processing pipeline
+    """
+    # 1. STT
+    transcript = await stt.transcribe(audio)
+    
+    # 2. LLM Stream
+    sentence_buffer = ""
+    async for token in llm.generate_stream(transcript):
+        sentence_buffer += token
+        
+        # Check for sentence end
+        if token.rstrip() in ['.', '!', '?']:
+            # 3. TTS + Send (non-blocking)
+            asyncio.create_task(
+                synthesize_and_send(sentence_buffer.strip(), ws)
+            )
+            sentence_buffer = ""
+
+async def synthesize_and_send(text: str, ws: WebSocket):
+    """
+    TTS synthesis and immediate send
+    """
+    audio_bytes = await tts.synthesize(text)
+    await ws.send_bytes(audio_bytes)
+```
+
+### Frontend Core Implementation
+
+```typescript
+// app/page.tsx
+'use client';
+
+import { useState, useRef, useEffect } from 'react';
+
+export default function VoiceChat() {
+  const [isRecording, setIsRecording] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const audioQueueRef = useRef<AudioBuffer[]>([]);
+  const isPlayingRef = useRef(false);
+
+  useEffect(() => {
+    // Initialize WebSocket
+    wsRef.current = new WebSocket('ws://localhost:8000/ws/audio');
+    
+    wsRef.current.onmessage = async (event) => {
+      const audioData = await event.data.arrayBuffer();
+      playAudio(audioData);
+    };
+
+    return () => wsRef.current?.close();
+  }, []);
+
+  const startRecording = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const audioContext = new AudioContext({ sampleRate: 16000 });
+    audioContextRef.current = audioContext;
+    
+    const source = audioContext.createMediaStreamSource(stream);
+    const processor = audioContext.createScriptProcessor(4096, 1, 1);
+    
+    processor.onaudioprocess = (e) => {
+      const inputData = e.inputBuffer.getChannelData(0);
+      const int16Array = new Int16Array(inputData.length);
+      
+      for (let i = 0; i < inputData.length; i++) {
+        int16Array[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+      }
+      
+      wsRef.current?.send(int16Array.buffer);
+    };
+    
+    source.connect(processor);
+    processor.connect(audioContext.destination);
+    
+    setIsRecording(true);
+  };
+
+  const playAudio = async (audioData: ArrayBuffer) => {
+    const audioContext = audioContextRef.current || new AudioContext();
+    const audioBuffer = await audioContext.decodeAudioData(audioData);
+    
+    audioQueueRef.current.push(audioBuffer);
+    
+    if (!isPlayingRef.current) {
+      playNextInQueue();
+    }
+  };
+
+  const playNextInQueue = () => {
+    if (audioQueueRef.current.length === 0) {
+      isPlayingRef.current = false;
+      return;
+    }
+    
+    isPlayingRef.current = true;
+    const buffer = audioQueueRef.current.shift()!;
+    const source = audioContextRef.current!.createBufferSource();
+    
+    source.buffer = buffer;
+    source.connect(audioContextRef.current!.destination);
+    source.onended = playNextInQueue;
+    source.start();
+  };
+
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen">
+      <button
+        onClick={isRecording ? stopRecording : startRecording}
+        className="px-8 py-4 text-xl font-bold rounded-full"
+      >
+        {isRecording ? '🔴 Recording...' : '🎤 Start Talking'}
+      </button>
+    </div>
+  );
+}
+```
+
+---
+
+## Performance Benchmarks
+
+### Target Metrics
+
+| Metric | MVP Target | Production Target | Measurement Method |
+|--------|-----------|-------------------|-------------------|
+| **End-to-End Latency** | <2000ms | <1500ms | User stop speaking → audio start |
+| **TTFT (Time to First Token)** | <500ms | <300ms | Transcript ready → LLM first token |
+| **Sentence Latency** | <800ms | <500ms | Sentence complete → audio start |
+| **Concurrent Users** | 10 | 100+ | Load testing with Locust |
+| **Audio Quality (MOS)** | >4.0 | >4.3 | Human evaluation |
+| **Transcription Accuracy (WER)** | <5% | <3% | Test dataset evaluation |
+
+### Load Testing Results (Expected)
+
+```bash
+# Single GPU (RTX 4090) Server
+Concurrent Users: 10
+Average Latency: 1.8s
+95th Percentile: 2.4s
+Throughput: 15 requests/minute
+GPU Utilization: 45%
+```
+
+### Optimization Checklist
+
+- [ ] Use `int8` quantization for Whisper
+- [ ] Enable `torch.compile()` for TTS (PyTorch 2.0+)
+- [ ] Implement model batching for concurrent users
+- [ ] Add Redis queue for request management
+- [ ] Enable GPU memory pooling
+- [ ] Use `asyncio` for all I/O operations
+- [ ] Implement connection pooling for LLM API
+- [ ] Add CDN for frontend assets
+- [ ] Enable WebSocket compression
+- [ ] Implement proper error recovery
+
+---
+
+## Deployment Architecture
+
+### Docker Compose Setup
+
+```yaml
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./models:/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8000
+    depends_on:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+```
+
+### Environment Variables
+
+```bash
+# .env
+GEMINI_API_KEY=your_api_key_here
+WHISPER_MODEL=distil-large-v3
+TTS_MODEL=kokoro-82m
+VAD_THRESHOLD=0.5
+SILENCE_DURATION_MS=300
+MAX_AUDIO_LENGTH_SEC=30
+```
+
+---
+
+## Error Handling & Edge Cases
+
+### Critical Error Scenarios
+
+| Error Type | Handling Strategy | User Experience |
+|------------|------------------|-----------------|
+| **WebSocket Disconnect** | Auto-reconnect with exponential backoff | "Reconnecting..." message |
+| **STT Failure** | Return generic response, log error | "I didn't catch that, could you repeat?" |
+| **LLM Timeout** | Fallback to cached response or error | "I'm having trouble thinking right now" |
+| **TTS Failure** | Return text response only | Show text fallback |
+| **GPU OOM** | Reduce batch size, clear cache | Slight latency increase |
+| **Network Congestion** | Buffer management, skip frames | Audio quality reduction notification |
+
+### Graceful Degradation
+
+```python
+# Fallback chain for TTS
+async def synthesize_with_fallback(text: str):
+    try:
+        return await kokoro_tts.synthesize(text)
+    except Exception as e:
+        logger.warning(f"Kokoro failed: {e}")
+        try:
+            return await styletts2.synthesize(text)
+        except Exception as e2:
+            logger.error(f"All TTS failed: {e2}")
+            return text  # Return text as last resort
+```
+
+---
+
+## Workflow Diagrams
+
+### Data Flow Diagram
+
+```
+┌────────┐                          ┌────────┐
+│        │   Audio Chunks (PCM)     │        │
+│ User   │─────────────────────────▶│ VAD    │
+│        │                          │        │
+└────────┘                          └───┬────┘
+                                        │
+                                        │ Speech End
+                                        │ Detected
+                                        ▼
+                                    ┌────────┐
+                                    │        │
+                                    │  STT   │
+                                    │        │
+                                    └───┬────┘
+                                        │
+                                        │ Transcript
+                                        │ Text
+                                        ▼
+                                    ┌────────┐
+                                    │        │
+                                    │  LLM   │◀──── System Prompt
+                                    │ Stream │      + History
+                                    └───┬────┘
+                                        │
+                ┌───────────────────────┼───────────────────────┐
+                │                       │                       │
+                │ Token 1-10            │ Token 11-25           │ Token 26+
+                ▼                       ▼                       ▼
+        ┌───────────────┐       ┌───────────────┐     ┌───────────────┐
+        │   Sentence    │       │   Sentence    │     │   Sentence    │
+        │   Buffer 1    │       │   Buffer 2    │     │   Buffer 3    │
+        └───────┬───────┘       └───────┬───────┘     └───────┬───────┘
+                │                       │                       │
+                │ "Hello!"              │ "How are you?"        │ "I'm fine."
+                ▼                       ▼                       ▼
+        ┌───────────────┐       ┌───────────────┐     ┌───────────────┐
+        │   TTS Task 1  │       │   TTS Task 2  │     │   TTS Task 3  │
+        │   (Async)     │       │   (Async)     │     │   (Async)     │
+        └───────┬───────┘       └───────┬───────┘     └───────┬───────┘
+                │                       │                       │
+                │ WAV Bytes             │ WAV Bytes             │ WAV Bytes
+                ▼                       ▼                       ▼
+        ┌───────────────────────────────────────────────────────────────┐
+        │                      WebSocket Send                            │
+        │                   (Sequential or Parallel)                     │
+        └───────────────────────┬───────────────────────────────────────┘
+                                │
+                                ▼
+                        ┌───────────────┐
+                        │  Audio Queue  │
+                        │   (Client)    │
+                        └───────┬───────┘
+                                │
+                                ▼
+                        ┌───────────────┐
+                        │   Speaker     │
+                        └───────────────┘
+```
+
+### Sequence Diagram
+
+```
+User          Client          Server(WS)      VAD       STT       LLM       TTS
+ │              │                │             │         │         │         │
+ │──Speech─────▶│                │             │         │         │         │
+ │              │                │             │         │         │         │
+ │              │──Audio Chunks─▶│             │         │         │         │
+ │              │     (20ms)     │             │         │         │         │
+ │              │                │──Analyze───▶│         │         │         │
+ │              │                │             │         │         │         │
+ │              │                │◀──Speech────┤         │         │         │
+ │              │                │   Detected  │         │         │         │
+ │              │                │             │         │         │         │
+ │──Silence────▶│                │             │         │         │         │
+ │              │                │             │         │         │         │
+ │              │──Last Chunks──▶│             │         │         │         │
+ │              │                │──Analyze───▶│         │         │         │
+ │              │                │             │         │         │         │
+ │              │                │◀──Silence───┤         │         │         │
+ │              │                │   300ms+    │         │         │         │
+ │              │                │             │         │         │         │
+ │              │                │──Buffer────────────▶│         │         │
+ │              │                │             │         │         │         │
+ │              │                │             │    ┌────┴────┐   │         │
+ │              │                │             │    │Processing│   │         │
+ │              │                │             │    └────┬────┘   │         │
+ │              │                │             │         │         │         │
+ │              │                │◀────────────────Transcript────│         │
+ │              │                │             │         │         │         │
+ │              │                │──Text──────────────────────▶│         │
+ │              │                │             │         │         │         │
+ │              │                │             │         │    ┌────┴────┐   │
+ │              │                │             │         │    │Streaming│   │
+ │              │                │             │         │    │ Tokens  │   │
+ │              │                │             │         │    └────┬────┘   │
+ │              │                │             │         │         │         │
+ │              │                │◀─────────────────Token Stream──┤         │
+ │              │                │             │         │         │         │
+ │              │                │──Sentence 1────────────────────────────▶│
+ │              │                │             │         │         │         │
+ │              │                │             │         │         │    ┌────┴────┐
+ │              │                │             │         │         │    │Synthesis│
+ │              │                │             │         │         │    └────┬────┘
+ │              │                │             │         │         │         │
+ │              │◀─────Audio 1───────────────────────────────────────────────┤
+ │              │                │             │         │         │         │
+ │◀──Play───────┤                │             │         │         │         │
+ │   Audio 1    │                │             │         │         │         │
+ │              │                │──Sentence 2────────────────────────────▶│
+ │              │                │             │         │         │         │
+ │              │◀─────Audio 2───────────────────────────────────────────────┤
+ │              │                │             │         │         │         │
+ │◀──Play───────┤                │             │         │         │         │
+ │   Audio 2    │                │             │         │         │         │
+ │              │                │             │         │         │         │
+```
+
+---
+
+## Future Enhancements
+
+### Phase 2 Features (Post-MVP)
+
+1. **Interruption Handling**
+   - Allow users to interrupt AI responses
+   - Cancel TTS queue mid-sentence
+   - Implement barge-in detection
+
+2. **Multi-Language Support**
+   - Auto-detect language with Whisper
+   - Multi-lingual TTS voices
+   - Translation layer
+
+3. **Emotion & Prosody Control**
+   - Emotion classification from user speech
+   - Dynamic TTS voice modulation
+   - Empathetic response generation
+
+4. **Context Management**
+   - Persistent conversation history
+   - Redis-based session storage
+   - Context window optimization
+
+5. **Advanced Features**
+   - Function calling / tool use
+   - Multimodal input (vision)
+   - Background music/ambiance
+   - Voice activity indicators
+
+---
+
+## Conclusion
+
+This MVP specification provides a **production-ready blueprint** for building a low-latency voice conversation system. Key achievements:
+
+✅ **Sub-2-second latency** through streaming pipelining  
+✅ **Optimal model selection** balancing speed and quality  
+✅ **Scalable architecture** supporting concurrent users  
+✅ **Clear implementation path** with code examples  
+
+### Quick Start Commands
+
+```bash
+# Backend setup
+cd backend
+pip install -r requirements.txt
+python -m services.download_models  # Downloads all models
+uvicorn main:app --reload
+
+# Frontend setup
+cd frontend
+npm install
+npm run dev
+
+# Access
+# Frontend: http://localhost:3000
+# Backend: http://localhost:8000
+# WebSocket: ws://localhost:8000/ws/audio
+```
+
+### Success Criteria
+
+- [ ] End-to-end latency < 2 seconds (95th percentile)
+- [ ] Transcription WER < 5%
+- [ ] Audio quality MOS > 4.0
+- [ ] Zero timeout errors under normal load
+- [ ] Supports 10 concurrent users on single GPU
+
+---
+
+**Document Version:** 1.0  
+**Last Updated:** February 2026  
+**Maintainer:** AI Engineering Team

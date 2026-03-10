@@ -1,0 +1,71 @@
+
+> frontend@0.0.0 lint
+> eslint .
+
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts
+   58:29  error    Error: Cannot access variable before it is declared
+
+`playNextAudio` is accessed before it is declared, which prevents the earlier access from updating when this value changes over time.
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts:58:29
+  56 |                         playQueueRef.current.push(audioBuffer);
+  57 |                         if (!isPlayingRef.current) {
+> 58 |                             playNextAudio();
+     |                             ^^^^^^^^^^^^^ `playNextAudio` accessed before it is declared
+  59 |                         }
+  60 |                     } catch (e) {
+  61 |                         console.error("Audio decode error", e);
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts:82:5
+   80 |     }, []);
+   81 |
+>  82 |     const playNextAudio = () => {
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+>  83 |         if (playQueueRef.current.length === 0) {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+>  84 |             isPlayingRef.current = false;
+      …
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+>  96 |         source.start();
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+>  97 |     };
+      | ^^^^^^^ `playNextAudio` is declared here
+   98 |
+   99 |     const startRecording = async () => {
+  100 |         try {  react-hooks/immutability
+   76:13  error    Error: Cannot access variable before it is declared
+
+`stopRecording` is accessed before it is declared, which prevents the earlier access from updating when this value changes over time.
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts:76:13
+  74 |             setStatus('Connecting');
+  75 |             setIsMicActive(false);
+> 76 |             stopRecording();
+     |             ^^^^^^^^^^^^^ `stopRecording` accessed before it is declared
+  77 |         };
+  78 |
+  79 |         wsRef.current = ws;
+
+C:\Projects\GETLANDED_VOICE_AGENT\frontend\src\hooks\useVoiceAgent.ts:136:5
+  134 |     };
+  135 |
+> 136 |     const stopRecording = () => {
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 137 |         if (processorRef.current) {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 138 |             processorRef.current.disconnect();
+      …
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 145 |         setIsMicActive(false);
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+> 146 |     };
+      | ^^^^^^^ `stopRecording` is declared here
+  147 |
+  148 |     const toggleMic = () => {
+  149 |         if (isMicActive) {                                                                                                                                                                                                              react-hooks/immutability
+   80:8   warning  React Hook useCallback has a missing dependency: 'playNextAudio'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        react-hooks/exhaustive-deps
+  176:8   warning  React Hook useEffect has a missing dependency: 'endSession'. Either include it or remove the dependency array                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             react-hooks/exhaustive-deps
+
+✖ 4 problems (2 errors, 2 warnings)
+

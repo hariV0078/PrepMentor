@@ -1,0 +1,32 @@
+# Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+**/.venv/
+**/venv/
+**/ENV/
+**/env/
+.env
+
+# Models
+**/models/
+**/*.pth
+**/*.bin
+**/*.onnx
+**/*.pt
+
+# Node
+**/node_modules/
+**/dist/
+**/build/
+**/.next/
+**/out/
+
+# IDE / OS
+**/.vscode/
+**/.idea/
+.DS_Store
+
+# Temporary files
+tmpclaude-*-cwd
+*.log
